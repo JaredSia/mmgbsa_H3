@@ -1,0 +1,3 @@
+variant_id,group,rna_sequence,modifications_json,replicate_id,notes
+BM_EXAMPLE,benchmark,ACGUACGUACGUACGUAAAAAAAAAAAAAAA,[],1,example only
+CTRL_EXAMPLE,control,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,[],1,example only

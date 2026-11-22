@@ -4,11 +4,11 @@ This is a **preflight**, not a complete structural preparation, mutation, minimi
 
 ## Notebook
 
-Open `PABPC1_RNA_structural_preflight.ipynb` in Google Colab. Run the cells in order. Upload `revised_template(1).pdb` and optionally the two revised Excel workbooks. The notebook installs pinned libraries, runs limited tests, compares the input sequence against UniProt P11940, performs a preliminary structural audit and produces a report ZIP. The notebook includes its own code; the separate `.py` files are provided for inspection and local testing.
+Open `PABPC1_RNA_structural_preflight.ipynb` in Google Colab. Run the cells in order. Upload `revised_template.pdb` (or `revised_template(1).pdb`) and optionally the two revised Excel workbooks. The notebook installs pinned libraries, runs limited tests, compares the input sequence against UniProt P11940, performs a preliminary structural audit and produces a report ZIP. The notebook includes its own code; the separate `.py` files are provided for inspection and local testing.
 
-The workbook report follows the stated convention: take 16 observed UTR bases ending at the most 3′ non-A, **retain** the original terminal A run and then append A15. `candidate_sequence` is only a planning sequence. It must not be used as a fixed-length 31-nt variant without a validated extension workflow. It is not an experimentally validated construct. Do not add terminal A residues twice in downstream preparations.
+The workbook report follows the stated convention: take 16 observed UTR bases ending at the most 3′ non-A, **retain** the original terminal A run and then append A15. `candidate_sequence` and the exported 61-row `variants_candidate_not_simulation_ready.csv` are for planning only. It must not be used as a fixed-length 31-nt variant without a validated extension workflow. It is not an experimentally validated construct. Do not add terminal A residues twice in downstream preparations.
 
-The raw PDB is preserved. A 1-Å CRYST1 box is reported; this tool does not remove it. The application must remove or override any placeholder box before simulation. Contact count is the number of protein–RNA heavy-atom pairs <2 Å, not the number of residues or a force-field clash score. Protein/RNA cannot be deemed stereochemically sound by this audit. Atom completeness checks cover canonical RNA heavy atoms (with special handling of the 5′ phosphate) and protein N/CA/C/O, not all protein side chains. Residue names and chain IDs must still be reviewed. Bio.PDB strict parsing can stop on malformed duplicate records.
+The raw PDB is preserved. The audit reports terminal phosphate atoms which conflict with the requested 5′-OH. A 1-Å CRYST1 box is reported; this tool does not remove it. The application must remove or override any placeholder box before simulation. Contact count is the number of protein–RNA heavy-atom pairs <2 Å, not the number of residues or a force-field clash score. Protein/RNA cannot be deemed stereochemically sound by this audit. Atom completeness checks cover canonical RNA heavy atoms (with special handling of the 5′ phosphate) and protein N/CA/C/O, not all protein side chains. Residue names and chain IDs must still be reviewed. Bio.PDB strict parsing can stop on malformed duplicate records.
 
 ## What is and is not implemented
 
@@ -25,7 +25,7 @@ The raw PDB is preserved. A 1-Å CRYST1 box is reported; this tool does not remo
 | Modified nucleotide geometry and parameters | Not implemented; unsupported modifications are marked `requires_parameterization` in CSV checks |
 | Full-batch structural generation, per-variant minimization and restart | Not implemented |
 
-`tests/test_physics.py` uses a one-particle harmonic model to confirm force constant and OpenMM minimization, **not** a test of a molecular complex. Example reports are not included in the repository because they contain user-provided sequences or model information; generated reports should be handled as private research data.
+`tests/test_physics.py` uses a one-particle harmonic model to confirm force constant and OpenMM minimization, **not** a test of a molecular complex. Example reports and candidate sequences are not included in this repository; generated reports should be handled as private research data.
 
 ## Locally
 

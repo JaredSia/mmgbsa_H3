@@ -88,7 +88,11 @@ def audit_pdb(path,uniprot_sequence=None):
  for left,right in zip(protein,protein[1:]):
   d=float(np.linalg.norm(left['C'].coord-right['N'].coord)) if 'C' in left and 'N' in right else None
   if d is None or not 1.1<=d<=1.8: peptide.append({'from':left.id[1],'to':right.id[1],'C_N_A':d})
+ five_prime_atoms=sorted(a.name for a in rna[0]) if rna else []
+ five_prime_phosphate=any(n in five_prime_atoms for n in ('P','OP1','OP2','OP3'))
  errors=[]
+ if five_prime_phosphate: errors.append('5-prime terminal phosphate atoms conflict with the requested 5-prime hydroxyl; explicit chemical conversion is required')
+ if placeholder: errors.append('CRYST1 placeholder box must be removed or overridden before periodic simulation')
  if models>1: errors.append('Multiple MODEL records')
  if duplicates or altloc: errors.append('Duplicate atoms or alternate locations require explicit review')
  if len(protein)!=360 or [r.id[1] for r in protein]!=list(range(1,361)): errors.append('Chain A is not the expected residues 1–360')
@@ -98,7 +102,7 @@ def audit_pdb(path,uniprot_sequence=None):
  if any(not b['within_1_3_to_2_0_A'] for b in bonds): errors.append('RNA linkage outlier or missing bond atoms')
  if peptide: errors.append('Protein peptide connectivity outlier')
  if contacts['minimum_A'] is not None and contacts['minimum_A']<2: errors.append('Protein–RNA contacts < 2 Å require structural review')
- return {'input_file':path.name,'sha256':sha256(path),'model_records':models,'chain_residue_counts':{k:len(v) for k,v in chains.items()},'protein_sequence':protseq,'uniprot_mapping_11_370_match':None if uniprot_sequence is None else protseq==uniprot_sequence[10:370], 'rna_sequence':rnaseq,'rna_mapping':[{'position':j+1,'chain':'E','residue':r.id[1],'base':r.resname} for j,r in enumerate(rna)],'cryst1':{'line':cryst,'lengths_A':box,'placeholder_detected':placeholder},'duplicate_atom_records':duplicates,'alternate_location_atom_records':altloc,'missing_atoms':missing,'rna_linkages':bonds,'peptide_linkage_outliers':peptide,'contacts':contacts,'preflight_errors':errors,'limitations':['Side-chain completeness, absolute stereochemistry and force-field matching are not fully validated by this audit.','A 5-prime hydroxyl and 3-prime hydroxyl are intended but terminal chemistry needs explicit atom/bond and template verification.','No relaxation or repair was performed.']}
+ return {'input_file':path.name,'sha256':sha256(path),'model_records':models,'chain_residue_counts':{k:len(v) for k,v in chains.items()},'protein_sequence':protseq,'uniprot_mapping_11_370_match':None if uniprot_sequence is None else protseq==uniprot_sequence[10:370], 'rna_sequence':rnaseq,'rna_mapping':[{'position':j+1,'chain':'E','residue':r.id[1],'base':r.resname} for j,r in enumerate(rna)],'rna_termini':{'five_prime_residue':rna[0].id[1] if rna else None,'five_prime_atoms':five_prime_atoms,'five_prime_phosphate_present':five_prime_phosphate,'intended_five_prime_chemistry':'5-prime hydroxyl','intended_three_prime_chemistry':'3-prime hydroxyl; verify'},'cryst1':{'line':cryst,'lengths_A':box,'placeholder_detected':placeholder},'duplicate_atom_records':duplicates,'alternate_location_atom_records':altloc,'missing_atoms':missing,'rna_linkages':bonds,'peptide_linkage_outliers':peptide,'contacts':contacts,'preflight_errors':errors,'limitations':['Side-chain completeness, absolute stereochemistry and force-field matching are not fully validated by this audit.','A 5-prime hydroxyl and 3-prime hydroxyl are intended but terminal chemistry needs explicit atom/bond and template verification.','No relaxation or repair was performed.']}
 
 def normalized_length_analysis(utr50,utr15):
  if not isinstance(utr50,str) or not isinstance(utr15,str): raise ValueError('missing sequence')

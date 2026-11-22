@@ -44,6 +44,16 @@ class Validate(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    p=Path(d)/'tiny.pdb'; p.write_text(text); a=audit_pdb(p,None)
    self.assertTrue(a['cryst1']['placeholder_detected']); self.assertEqual(a['contacts']['pairs_lt_2A'],1)
+ def test_5prime_phosphate_and_placeholder_box_are_flagged(self):
+  text=("CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1\n"
+        "ATOM      1    P   A E  37       1.000   0.000   0.000  1.00  0.00           P\n"
+        "ATOM      2  OP1   A E  37       1.000   1.000   0.000  1.00  0.00           O\n"
+        "ATOM      3  OP2   A E  37       1.000  -1.000   0.000  1.00  0.00           O\nEND\n")
+  with tempfile.TemporaryDirectory() as d:
+   p=Path(d)/'tiny.pdb'; p.write_text(text); a=audit_pdb(p,None)
+   self.assertTrue(a['rna_termini']['five_prime_phosphate_present'])
+   self.assertTrue(any('5-prime' in x for x in a['preflight_errors']))
+   self.assertTrue(any('CRYST1' in x for x in a['preflight_errors']))
  def test_counts(self):
   with self.assertRaises(ValueError): validate_variants(self.csvfile([self.row()]))
 if __name__=='__main__': unittest.main()

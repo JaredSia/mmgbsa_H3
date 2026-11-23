@@ -14,6 +14,8 @@ from preflight import audit_pdb
 
 RNA_BB={"P","OP1","OP2","O5'","C5'","C4'","O4'","C3'","O3'","C2'","O2'","C1'"}
 FF_NAMES=['amber19/protein.ff19SB.xml','amber14/RNA.OL3.xml','amber19/tip3p.xml']
+PREVIOUS_RUNNER_SHA='c71d18437d2e9997afadc6b130ef603801c2cce3ff8585a8a28a5e22956371f2'
+MAX_FINAL_PROJECTION_A=0.01
 
 def digest(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 def atomic_json(p,obj):
@@ -81,13 +83,89 @@ def validate_geometry(d,require_no_interchain_clash):
  if not math.isfinite(d['interchain_minimum_A']):issues.append('nonfinite geometry')
  if issues:raise RuntimeError('; '.join(issues))
 
-def convergence_observed(last,tolerance):
- return bool(last is not None and last['objective_gradient_rms_kJ_mol_nm']<=tolerance and last['max_constraint_error']<=1e-5)
+def supported_upgrade(saved,current):
+ # Migration only from the exact published runner with this known gate bug.
+ return (saved.get('runner_sha256')==PREVIOUS_RUNNER_SHA and
+         saved.keys()==current.keys() and
+         all(saved[k]==current[k] for k in saved if k!='runner_sha256'))
+
+def backup_previous_water(out):
+ # Preserve the previous water-stage artifacts before continuing that stage.
+ out=Path(out);names=['stage0_water_state.xml','stage0_water.pdb','stage0_water_diagnostics.json'];paths=[out/n for n in names]
+ if not any(p.exists() for p in paths):return
+ if not all(p.exists() for p in paths):raise ValueError('Cannot migrate: previous water-stage files are incomplete')
+ try:qa=json.loads(paths[2].read_text());expected=qa['artifact_sha256']
+ except (ValueError,KeyError) as e:raise ValueError('Cannot migrate: invalid previous water-stage diagnostics') from e
+ if digest(paths[0])!=expected.get('state') or digest(paths[1])!=expected.get('pdb'):raise ValueError('Cannot migrate: previous water-stage checksum mismatch')
+ backup=out/'before_final_constraint_fix';backup.mkdir(exist_ok=True)
+ hashes={}
+ for src in paths:
+  dest=backup/src.name;actual=digest(src)
+  if dest.exists():
+   if digest(dest)!=actual:raise ValueError('Cannot migrate: existing water-stage backup differs')
+  else:
+   tmp=backup/(src.name+'.tmp');shutil.copyfile(src,tmp)
+   if digest(tmp)!=actual:raise ValueError('Cannot migrate: water-stage backup checksum mismatch')
+   tmp.replace(dest)
+  hashes[src.name]=actual
+ atomic_json(backup/'backup_manifest.json',{'sha256':hashes,'note':'Prior water-stage checkpoint, before constraint-check correction.'})
+
+def measure_constraints(system,positions_nm):
+ # OpenMM's constraint kernel uses direct coordinate differences. Positions
+ # here are the final unwrapped Context positions, not rounded PDB positions.
+ n=system.getNumConstraints()
+ if n==0:return {'constraint_count':0,'max_relative_error':0.0,'violations_above_1e_minus_5':0}
+ first=np.empty(n,dtype=int);second=np.empty(n,dtype=int);target=np.empty(n,dtype=float)
+ for i in range(n):
+  a,b,l=system.getConstraintParameters(i);first[i]=a;second[i]=b;target[i]=l.value_in_unit(unit.nanometer)
+ if np.any(target<=0):raise ValueError('Invalid nonpositive constraint distance')
+ dist=np.linalg.norm(positions_nm[first]-positions_nm[second],axis=1)
+ error=np.abs(dist-target)/target
+ if not np.isfinite(error).all():raise ValueError('Nonfinite final constraint error')
+ return {'constraint_count':n,'max_relative_error':float(np.max(error)),'violations_above_1e_minus_5':int(np.count_nonzero(error>1e-5))}
+
+def projected_force_metrics(system,positions_nm,forces_kJ_mol_nm,box_vectors):
+ # Orthogonally project force onto the constraint tangent space. An OpenMM
+ # velocity projection with equal masses is an Euclidean projection; numeric
+ # force values are passed as velocities solely to obtain the linear projection.
+ n=system.getNumParticles();forces=np.asarray(forces_kJ_mol_nm,dtype=float)
+ if forces.shape!=(n,3) or not np.isfinite(forces).all():raise ValueError('Invalid final forces for projection')
+ ncon=system.getNumConstraints()
+ if ncon==0:return {'rms_kJ_mol_nm':float(np.sqrt(np.mean(forces*forces))),'max_constraint_normal_kJ_mol_nm':0.0}
+ for i in range(n):
+  if system.getParticleMass(i).value_in_unit(unit.dalton)<=0:raise ValueError('Force projection does not support zero-mass particles')
+ projected_system=mm.System()
+ for _ in range(n):projected_system.addParticle(1.0)
+ first=np.empty(ncon,dtype=int);second=np.empty(ncon,dtype=int)
+ for i in range(ncon):
+  a,b,length=system.getConstraintParameters(i);first[i]=a;second[i]=b;projected_system.addConstraint(a,b,length)
+ projected_system.setDefaultPeriodicBoxVectors(*box_vectors)
+ integrator=mm.VerletIntegrator(.001)
+ context=mm.Context(projected_system,integrator,mm.Platform.getPlatformByName('CPU'),{'Threads':os.environ.get('OPENMM_CPU_THREADS','2')})
+ try:
+  context.setPositions(positions_nm);context.setVelocities(forces*unit.nanometer/unit.picosecond);context.applyVelocityConstraints(1e-8)
+  projected=np.asarray(context.getState(getVelocities=True).getVelocities(asNumpy=True).value_in_unit(unit.nanometer/unit.picosecond))
+ finally:del context,integrator
+ if not np.isfinite(projected).all():raise ValueError('Nonfinite projected force')
+ xyz=np.asarray(positions_nm.value_in_unit(unit.nanometer))
+ delta=xyz[first]-xyz[second];length=np.linalg.norm(delta,axis=1)
+ if np.any(length<=0):raise ValueError('Zero-length constrained bond')
+ normal=np.abs(np.sum(delta*(projected[first]-projected[second]),axis=1))/length
+ residual=float(np.max(normal));limit=max(1e-4,1e-7*float(np.max(np.abs(forces))))
+ if residual>limit:raise ValueError(f'Force projection constraint residual {residual} exceeds {limit}')
+ return {'rms_kJ_mol_nm':float(np.sqrt(np.mean(projected*projected))),'max_constraint_normal_kJ_mol_nm':residual}
+
+def convergence_observed(last,tolerance,final_constraint_error,projection_A,final_projected_force_rms):
+ # Last reporter values are provisional: OpenMM performs a final projection.
+ return bool(last is not None and final_constraint_error is not None and projection_A is not None and final_projected_force_rms is not None and
+             last['objective_gradient_rms_kJ_mol_nm']<=tolerance and final_projected_force_rms<=tolerance and
+             final_constraint_error<=1e-5 and projection_A<=MAX_FINAL_PROJECTION_A)
 
 class Tracker(mm.MinimizationReporter):
- def __init__(self):super().__init__();self.calls=0;self.last=None
+ def __init__(self):super().__init__();self.calls=0;self.last=None;self.last_positions_nm=None
  def report(self,iteration,x,grad,args):
   self.calls+=1;g=np.asarray(grad,dtype=float)
+  self.last_positions_nm=np.asarray(x,dtype=float).reshape((-1,3)).copy()
   self.last={'iteration':int(iteration),'objective_gradient_rms_kJ_mol_nm':float(np.sqrt(np.mean(g*g))),'max_constraint_error':float(args['max constraint error'])}
   return False
 
@@ -119,8 +197,15 @@ def minimize_with_retries(ctx,tolerance,iterations):
  for _ in range(3):
   if remaining<=0:break
   tracker=Tracker();budget=remaining;mm.LocalEnergyMinimizer.minimize(ctx,tolerance,budget,tracker)
-  attempts.append({'iteration_budget':budget,'reporter_calls':tracker.calls,'last_reporter':tracker.last})
-  if convergence_observed(tracker.last,tolerance) or tracker.calls==0 or tracker.calls>=budget:break
+  final_state=ctx.getState(getPositions=True,getForces=True)
+  final_positions=final_state.getPositions(asNumpy=True);final=np.asarray(final_positions.value_in_unit(unit.nanometer))
+  final_forces=np.asarray(final_state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer))
+  constraints=measure_constraints(ctx.getSystem(),final)
+  projected=projected_force_metrics(ctx.getSystem(),final_positions,final_forces,final_state.getPeriodicBoxVectors())
+  projection_A=None if tracker.last_positions_nm is None else float(np.linalg.norm(final-tracker.last_positions_nm,axis=1).max()*10)
+  observed=convergence_observed(tracker.last,tolerance,constraints['max_relative_error'],projection_A,projected['rms_kJ_mol_nm'])
+  attempts.append({'iteration_budget':budget,'reporter_calls':tracker.calls,'last_reporter':tracker.last,'final_constraints':constraints,'final_projected_forces':projected,'last_reporter_to_final_max_displacement_A':projection_A,'screening_thresholds_observed':observed})
+  if observed or tracker.calls==0 or tracker.calls>=budget:break
   remaining-=tracker.calls
  return tracker,attempts
 
@@ -131,8 +216,12 @@ def minimize_stage(name,ctx,top,sel,original,out,iterations,all_k,anchor_k,toler
  pos=state.getPositions(asNumpy=True);xyz=np.asarray(pos.value_in_unit(unit.nanometer));force=np.asarray(state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer))
  if not np.isfinite(xyz).all() or not np.isfinite(force).all():raise RuntimeError('Nonfinite coordinates or forces in '+name)
  def energy(groups):return float(ctx.getState(getEnergy=True,groups=groups).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
- qa=diagnostics(xyz,original,sel); qa.update({'stage':name,'energy_interpretation':'artificial soft repulsion and bonded terms; not full force field' if soft_stage else 'full force field','seconds':time.monotonic()-t,'max_iterations':iterations,'base_system_energy_kJ_mol':energy({0}),'physical_forcefield_energy_kJ_mol':None if soft_stage else energy({0}),'positional_restraint_energy_kJ_mol':energy({1,2}),'stereochemistry_penalty_kJ_mol':energy({3}),'total_energy_kJ_mol':energy({0,1,2,3}),'maximum_unprojected_force_kJ_mol_nm':float(np.linalg.norm(force,axis=1).max()),'reporter_calls':sum(a['reporter_calls'] for a in attempts),'minimizer_attempts':attempts,'last_reporter':tracker.last,'convergence_status':'not established; reporter gradient includes constraint penalties and early termination is possible','restraint_definition':'E=0.5*k*sum(displacement^2)','k_all_kJ_mol_nm2':all_k,'k_anchor_kJ_mol_nm2':anchor_k})
- observed=convergence_observed(tracker.last,tolerance)
+ qa=diagnostics(xyz,original,sel); qa.update({'stage':name,'energy_interpretation':'artificial soft repulsion and bonded terms; not full force field' if soft_stage else 'full force field','seconds':time.monotonic()-t,'max_iterations':iterations,'base_system_energy_kJ_mol':energy({0}),'physical_forcefield_energy_kJ_mol':None if soft_stage else energy({0}),'positional_restraint_energy_kJ_mol':energy({1,2}),'stereochemistry_penalty_kJ_mol':energy({3}),'total_energy_kJ_mol':energy({0,1,2,3}),'maximum_unprojected_force_kJ_mol_nm':float(np.linalg.norm(force,axis=1).max()),'reporter_calls':sum(a['reporter_calls'] for a in attempts),'minimizer_attempts':attempts,'last_reporter':tracker.last,'convergence_status':'screening only: final force is projected into the constraint tangent space; this does not prove a biological pose or a global minimum','restraint_definition':'E=0.5*k*sum(displacement^2)','k_all_kJ_mol_nm2':all_k,'k_anchor_kJ_mol_nm2':anchor_k})
+ final_constraints=measure_constraints(ctx.getSystem(),xyz)
+ projection_A=None if tracker.last_positions_nm is None else float(np.linalg.norm(xyz-tracker.last_positions_nm,axis=1).max()*10)
+ final_projected=projected_force_metrics(ctx.getSystem(),pos,force,state.getPeriodicBoxVectors())
+ observed=convergence_observed(tracker.last,tolerance,final_constraints['max_relative_error'],projection_A,final_projected['rms_kJ_mol_nm'])
+ qa['final_constraints']=final_constraints;qa['final_projected_forces']=final_projected;qa['last_reporter_to_final_max_displacement_A']=projection_A;qa['projection_screening_limit_A']=MAX_FINAL_PROJECTION_A
  qa['reporter_threshold_observed']=observed
  # A diagnostic is the commit marker: it is written only after the PDB and
  # exact OpenMM state are saved, reloaded and hashed.
@@ -143,7 +232,7 @@ def minimize_stage(name,ctx,top,sel,original,out,iterations,all_k,anchor_k,toler
  atomic_json(out/(name+'_diagnostics.json'),qa)
  validate_geometry(qa,not soft_stage)
  if not soft_stage and abs(qa['stereochemistry_penalty_kJ_mol'])>1e-6:raise RuntimeError('Stereochemistry penalty remains active; do not use this stage as an unbiased force-field minimum')
- if not soft_stage and not observed and not allow_unconverged:raise RuntimeError(f'{name} did not show the requested gradient/constraint thresholds; inspect diagnostics; early optimizer termination or poor geometry may persist even with more iterations')
+ if not soft_stage and not observed and not allow_unconverged:raise RuntimeError(f'{name} did not show the requested gradient/constraint thresholds; inspect final constraint, projection and gradient diagnostics; early termination or poor geometry may persist even with more iterations')
  print(name, 'iterations reported',tracker.calls,'min distance Å',round(qa['interchain_minimum_A'],3),'RNA bb RMSD Å',round(qa['RNA_backbone_RMSD_protein_aligned_A'],3),'seconds',round(qa['seconds'],1),flush=True)
  return qa,pos
 
@@ -175,8 +264,19 @@ def main(source,out,platform='auto',dry_steps=2000,water_steps=2000,stage_steps=
  ff=app.ForceField(*FF_NAMES)
  if identity_path.exists():
   old=json.loads(identity_path.read_text())
-  if old['identity']!=identity:raise ValueError('Cannot resume: input, code, seed or OpenMM version differs from the original run')
   if old['initial_pdb_sha256']!=digest(initial_pdb) or old['initial_positions_sha256']!=digest(initial_npy):raise ValueError('Cannot resume: initial checkpoint checksum mismatch')
+  if old['identity']!=identity:
+   if not supported_upgrade(old['identity'],identity):
+    changed=[k for k in sorted(set(old['identity'])|set(identity)) if old['identity'].get(k)!=identity.get(k)]
+    raise ValueError('Cannot resume: input, code, seed or OpenMM version differs from the original run: '+str(changed))
+   # Preserve the exact prior water stage and manifest before continuation.
+   backup_previous_water(out)
+   backup=out/'run_identity_before_final_constraint_fix.json'
+   if backup.exists() and json.loads(backup.read_text())!=old:raise ValueError('Cannot migrate: previous identity backup differs')
+   if not backup.exists():atomic_json(backup,old)
+   old['identity']=identity;old['migration_note']='Upgraded known runner to evaluate final post-projection constraints; prior manifest saved unchanged.'
+   atomic_json(identity_path,old)
+   print('Migrated known prior runner identity; backed up the previous manifest and water stage.',flush=True)
   loaded=app.PDBFile(str(initial_pdb));original=np.load(initial_npy,allow_pickle=False)
   if original.shape!=(loaded.topology.getNumAtoms(),3):raise ValueError('Cannot resume: initial atom count mismatch')
   mod=app.Modeller(loaded.topology,original*unit.nanometer);print('Resuming run from verified checkpoints:',out,flush=True)

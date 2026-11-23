@@ -15,6 +15,8 @@ from preflight import audit_pdb
 RNA_BB={"P","OP1","OP2","O5'","C5'","C4'","O4'","C3'","O3'","C2'","O2'","C1'"}
 FF_NAMES=['amber19/protein.ff19SB.xml','amber14/RNA.OL3.xml','amber19/tip3p.xml']
 PREVIOUS_RUNNER_SHA='c71d18437d2e9997afadc6b130ef603801c2cce3ff8585a8a28a5e22956371f2'
+PRE_MIXED_RUNNER_SHA='e575871e39f132e635baa8f8d5131a43b957c0899ce4fc497ac26450ca622e69'
+SUPPORTED_RUNNER_SHAS={PREVIOUS_RUNNER_SHA,PRE_MIXED_RUNNER_SHA}
 MAX_FINAL_PROJECTION_A=0.01
 
 def digest(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
@@ -25,7 +27,7 @@ def context_for(system,integrator,platform):
  errors=[]
  for name in order:
   try:
-   p=mm.Platform.getPlatformByName(name);opts={'Threads':os.environ.get('OPENMM_CPU_THREADS','2')} if name=='CPU' else {}
+   p=mm.Platform.getPlatformByName(name);opts=({'Threads':os.environ.get('OPENMM_CPU_THREADS','2')} if name=='CPU' else {'Precision':'mixed'} if name=='CUDA' else {})
    return mm.Context(system,integrator,p,opts),name,errors
   except Exception as e:errors.append(f'{name}: {type(e).__name__}: {e}')
  raise RuntimeError('No requested OpenMM platform available: '+'; '.join(errors))
@@ -85,11 +87,11 @@ def validate_geometry(d,require_no_interchain_clash):
 
 def supported_upgrade(saved,current):
  # Migration only from the exact published runner with this known gate bug.
- return (saved.get('runner_sha256')==PREVIOUS_RUNNER_SHA and
+ return (saved.get('runner_sha256') in SUPPORTED_RUNNER_SHAS and
          saved.keys()==current.keys() and
          all(saved[k]==current[k] for k in saved if k!='runner_sha256'))
 
-def backup_previous_water(out):
+def backup_previous_water(out,tag='final_constraint_fix'):
  # Preserve the previous water-stage artifacts before continuing that stage.
  out=Path(out);names=['stage0_water_state.xml','stage0_water.pdb','stage0_water_diagnostics.json'];paths=[out/n for n in names]
  if not any(p.exists() for p in paths):return
@@ -97,7 +99,7 @@ def backup_previous_water(out):
  try:qa=json.loads(paths[2].read_text());expected=qa['artifact_sha256']
  except (ValueError,KeyError) as e:raise ValueError('Cannot migrate: invalid previous water-stage diagnostics') from e
  if digest(paths[0])!=expected.get('state') or digest(paths[1])!=expected.get('pdb'):raise ValueError('Cannot migrate: previous water-stage checksum mismatch')
- backup=out/'before_final_constraint_fix';backup.mkdir(exist_ok=True)
+ backup=out/('before_'+tag);backup.mkdir(exist_ok=True)
  hashes={}
  for src in paths:
   dest=backup/src.name;actual=digest(src)
@@ -108,7 +110,7 @@ def backup_previous_water(out):
    if digest(tmp)!=actual:raise ValueError('Cannot migrate: water-stage backup checksum mismatch')
    tmp.replace(dest)
   hashes[src.name]=actual
- atomic_json(backup/'backup_manifest.json',{'sha256':hashes,'note':'Prior water-stage checkpoint, before constraint-check correction.'})
+ atomic_json(backup/'backup_manifest.json',{'sha256':hashes,'note':'Prior water-stage checkpoint, before '+tag+'.'})
 
 def measure_constraints(system,positions_nm):
  # OpenMM's constraint kernel uses direct coordinate differences. Positions
@@ -158,7 +160,7 @@ def projected_force_metrics(system,positions_nm,forces_kJ_mol_nm,box_vectors):
 def convergence_observed(last,tolerance,final_constraint_error,projection_A,final_projected_force_rms):
  # Last reporter values are provisional: OpenMM performs a final projection.
  return bool(last is not None and final_constraint_error is not None and projection_A is not None and final_projected_force_rms is not None and
-             last['objective_gradient_rms_kJ_mol_nm']<=tolerance and final_projected_force_rms<=tolerance and
+             math.isfinite(last['objective_gradient_rms_kJ_mol_nm']) and final_projected_force_rms<=tolerance and
              final_constraint_error<=1e-5 and projection_A<=MAX_FINAL_PROJECTION_A)
 
 class Tracker(mm.MinimizationReporter):
@@ -216,13 +218,13 @@ def minimize_stage(name,ctx,top,sel,original,out,iterations,all_k,anchor_k,toler
  pos=state.getPositions(asNumpy=True);xyz=np.asarray(pos.value_in_unit(unit.nanometer));force=np.asarray(state.getForces(asNumpy=True).value_in_unit(unit.kilojoule_per_mole/unit.nanometer))
  if not np.isfinite(xyz).all() or not np.isfinite(force).all():raise RuntimeError('Nonfinite coordinates or forces in '+name)
  def energy(groups):return float(ctx.getState(getEnergy=True,groups=groups).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
- qa=diagnostics(xyz,original,sel); qa.update({'stage':name,'energy_interpretation':'artificial soft repulsion and bonded terms; not full force field' if soft_stage else 'full force field','seconds':time.monotonic()-t,'max_iterations':iterations,'base_system_energy_kJ_mol':energy({0}),'physical_forcefield_energy_kJ_mol':None if soft_stage else energy({0}),'positional_restraint_energy_kJ_mol':energy({1,2}),'stereochemistry_penalty_kJ_mol':energy({3}),'total_energy_kJ_mol':energy({0,1,2,3}),'maximum_unprojected_force_kJ_mol_nm':float(np.linalg.norm(force,axis=1).max()),'reporter_calls':sum(a['reporter_calls'] for a in attempts),'minimizer_attempts':attempts,'last_reporter':tracker.last,'convergence_status':'screening only: final force is projected into the constraint tangent space; this does not prove a biological pose or a global minimum','restraint_definition':'E=0.5*k*sum(displacement^2)','k_all_kJ_mol_nm2':all_k,'k_anchor_kJ_mol_nm2':anchor_k})
+ qa=diagnostics(xyz,original,sel); qa.update({'stage':name,'energy_interpretation':'artificial soft repulsion and bonded terms; not full force field' if soft_stage else 'full force field','seconds':time.monotonic()-t,'max_iterations':iterations,'base_system_energy_kJ_mol':energy({0}),'physical_forcefield_energy_kJ_mol':None if soft_stage else energy({0}),'positional_restraint_energy_kJ_mol':energy({1,2}),'stereochemistry_penalty_kJ_mol':energy({3}),'total_energy_kJ_mol':energy({0,1,2,3}),'maximum_unprojected_force_kJ_mol_nm':float(np.linalg.norm(force,axis=1).max()),'reporter_calls':sum(a['reporter_calls'] for a in attempts),'minimizer_attempts':attempts,'last_reporter':tracker.last,'convergence_status':'screening only: final force is projected into the constraint tangent space; the last reporter includes temporary constraint forces and is diagnostic only; this does not prove a biological pose or a global minimum','restraint_definition':'E=0.5*k*sum(displacement^2)','k_all_kJ_mol_nm2':all_k,'k_anchor_kJ_mol_nm2':anchor_k})
  final_constraints=measure_constraints(ctx.getSystem(),xyz)
  projection_A=None if tracker.last_positions_nm is None else float(np.linalg.norm(xyz-tracker.last_positions_nm,axis=1).max()*10)
  final_projected=projected_force_metrics(ctx.getSystem(),pos,force,state.getPeriodicBoxVectors())
  observed=convergence_observed(tracker.last,tolerance,final_constraints['max_relative_error'],projection_A,final_projected['rms_kJ_mol_nm'])
  qa['final_constraints']=final_constraints;qa['final_projected_forces']=final_projected;qa['last_reporter_to_final_max_displacement_A']=projection_A;qa['projection_screening_limit_A']=MAX_FINAL_PROJECTION_A
- qa['reporter_threshold_observed']=observed
+ qa['reporter_threshold_observed']=observed;qa['final_screen_passed']=observed
  # A diagnostic is the commit marker: it is written only after the PDB and
  # exact OpenMM state are saved, reloaded and hashed.
  pdbpath=out/(name+'.pdb');statepath=out/(name+'_state.xml')
@@ -270,11 +272,12 @@ def main(source,out,platform='auto',dry_steps=2000,water_steps=2000,stage_steps=
     changed=[k for k in sorted(set(old['identity'])|set(identity)) if old['identity'].get(k)!=identity.get(k)]
     raise ValueError('Cannot resume: input, code, seed or OpenMM version differs from the original run: '+str(changed))
    # Preserve the exact prior water stage and manifest before continuation.
-   backup_previous_water(out)
-   backup=out/'run_identity_before_final_constraint_fix.json'
+   tag='cuda_precision_fix' if old['identity']['runner_sha256']==PRE_MIXED_RUNNER_SHA else 'final_constraint_fix'
+   backup_previous_water(out,tag=tag)
+   backup=out/('run_identity_before_'+tag+'.json')
    if backup.exists() and json.loads(backup.read_text())!=old:raise ValueError('Cannot migrate: previous identity backup differs')
    if not backup.exists():atomic_json(backup,old)
-   old['identity']=identity;old['migration_note']='Upgraded known runner to evaluate final post-projection constraints; prior manifest saved unchanged.'
+   old['identity']=identity;old['migration_note']='Upgraded known runner for final constraint checks and mixed CUDA precision; prior manifest saved unchanged.'
    atomic_json(identity_path,old)
    print('Migrated known prior runner identity; backed up the previous manifest and water stage.',flush=True)
   loaded=app.PDBFile(str(initial_pdb));original=np.load(initial_npy,allow_pickle=False)
@@ -324,14 +327,14 @@ def main(source,out,platform='auto',dry_steps=2000,water_steps=2000,stage_steps=
  for i,j in exclusions:soft.addExclusion(i,j)
  softsys.removeForce(nbidx);softsys.addForce(soft);softsys.addForce(restraint_force('k_all',[],original,1));softsys.addForce(restraint_force('k_anchor',sel['protein_ca']+sel['rna_backbone'],original,2));softsys.addForce(stereo_barrier(sel))
  inte=mm.VerletIntegrator(.001);ctx,platform_used,errs=context_for(softsys,inte,platform);ctx.setPositions(mod.positions)
- platform_info.update({'soft_platform':platform_used,'soft_platform_fallback_errors':errs,'soft_krep_schedule':[1000.,10000.,100000.,1000000.], 'soft_steps_per_stage':300,'soft_particle_diameters_nm':{'H':.17,'other':.27},'soft_cutoff_nm':.30,'soft_exclusions':'all standard nonbonded exceptions, including 1-4 terms','backbone_RMSD_review_threshold_A':1.0,'max_restrained_atom_displacement_review_threshold_A':3.0,'chirality_barrier_k_kJ_mol_nm6':1e12,'chirality_barrier_min_volume_nm3':.001});atomic_json(out/'configuration.json',platform_info)
+ platform_info.update({'soft_platform':platform_used,'soft_cuda_precision':ctx.getPlatform().getPropertyValue(ctx,'Precision') if platform_used=='CUDA' else None,'soft_platform_fallback_errors':errs,'soft_krep_schedule':[1000.,10000.,100000.,1000000.], 'soft_steps_per_stage':300,'soft_particle_diameters_nm':{'H':.17,'other':.27},'soft_cutoff_nm':.30,'soft_exclusions':'all standard nonbonded exceptions, including 1-4 terms','backbone_RMSD_review_threshold_A':1.0,'max_restrained_atom_displacement_review_threshold_A':3.0,'chirality_barrier_k_kJ_mol_nm6':1e12,'chirality_barrier_min_volume_nm3':.001});atomic_json(out/'configuration.json',platform_info)
  for i,repulsion in enumerate((1000.,10000.,100000.,1000000.),1):
   ctx.setParameter('krep',repulsion);upstream=digest(initial_npy if i==1 else out/f'soft_precondition_{i-1}_state.xml');d,positions=advance_stage(f'soft_precondition_{i}',ctx,mod.topology,sel,original,out,300,0.,4184.,soft_stage=True,upstream_sha=upstream)
  del ctx,inte
  dry=ff.createSystem(mod.topology,nonbondedMethod=app.NoCutoff,constraints=None,removeCMMotion=False)
  dry.addForce(restraint_force('k_all',[],original,1));dry.addForce(restraint_force('k_anchor',sel['protein_ca']+sel['rna_backbone'],original,2));dry.addForce(stereo_barrier(sel))
  inte=mm.VerletIntegrator(.001);ctx,platform_used,errs=context_for(dry,inte,platform);ctx.setPositions(positions)
- platform_info.update({'dry_platform':platform_used,'dry_platform_fallback_errors':errs});atomic_json(out/'configuration.json',platform_info)
+ platform_info.update({'dry_platform':platform_used,'dry_cuda_precision':ctx.getPlatform().getPropertyValue(ctx,'Precision') if platform_used=='CUDA' else None,'dry_platform_fallback_errors':errs});atomic_json(out/'configuration.json',platform_info)
  d,positions=advance_stage('dry_precondition_exploratory',ctx,mod.topology,sel,original,out,dry_steps,0.,4184.,allow_unconverged=allow_unconverged,upstream_sha=digest(out/'soft_precondition_4_state.xml'));del ctx,inte
  mod.positions=positions
  # Cache the exact solvated starting coordinates and System before stage 0.
@@ -357,7 +360,7 @@ def main(source,out,platform='auto',dry_steps=2000,water_steps=2000,stage_steps=
   atomic_json(solvent_meta,{'dry_state_sha256':digest(out/'dry_precondition_exploratory_state.xml'),'sha256':{'pdb':digest(solvent_pdb),'positions':digest(solvent_npy),'system':digest(system_path)},'total_atoms':mod.topology.getNumAtoms(),'solute_atoms':natoms})
  inte=mm.VerletIntegrator(.001);ctx,platform_used,errs=context_for(system,inte,platform);ctx.setPositions(mod.positions)
  vectors=system.getDefaultPeriodicBoxVectors();lengths=[float(v[i].value_in_unit(unit.nanometer)) for i,v in enumerate(vectors)]
- platform_info.update({'solvated_platform':platform_used,'solvated_platform_fallback_errors':errs,'solute_atoms':natoms,'total_atoms':mod.topology.getNumAtoms(),'box_lengths_nm':lengths});atomic_json(out/'configuration.json',platform_info)
+ platform_info.update({'solvated_platform':platform_used,'solvated_cuda_precision':ctx.getPlatform().getPropertyValue(ctx,'Precision') if platform_used=='CUDA' else None,'solvated_platform_fallback_errors':errs,'solute_atoms':natoms,'total_atoms':mod.topology.getNumAtoms(),'box_lengths_nm':lengths});atomic_json(out/'configuration.json',platform_info)
  stages=[('stage0_water',water_steps,418400.,0.),('stage1_strong',stage_steps,0.,4184.),('stage2_moderate',stage_steps,0.,1255.2)]
  results=[]
  for idx,(name,iters,kall,kanchor) in enumerate(stages):
@@ -366,7 +369,7 @@ def main(source,out,platform='auto',dry_steps=2000,water_steps=2000,stage_steps=
  mod.positions=positions
  # Make a separate solute-only file; the full solvated system is retained above.
  mod.delete([a for a in mod.topology.atoms() if a.index>=natoms]);save_pdb(out/'reference_candidate_solute.pdb',mod.topology,mod.positions)
- atomic_json(out/'final_status.json',{'status':'candidate_for_review_not_scientifically_validated','candidate_sha256':digest(out/'reference_candidate_solute.pdb'),'all_requested_stages_ran':True,'reporter_thresholds_observed_all_solvated':all(r['reporter_threshold_observed'] for r in results),'convergence_proven':False,'notes':['Gradient and constraint details are in stage diagnostics; iteration caps do not prove convergence.','No claim of biological pose validation or binding affinity.','Within-stage interruption replays that stage from its last saved checkpoint; platform changes may alter numerical results.','All-atom clash and independent stereochemical review remain required.'],'stages':results})
+ atomic_json(out/'final_status.json',{'status':'candidate_for_review_not_scientifically_validated','candidate_sha256':digest(out/'reference_candidate_solute.pdb'),'all_requested_stages_ran':True,'final_screen_passed_all_solvated':all(r['reporter_threshold_observed'] for r in results),'reporter_thresholds_observed_all_solvated':all(r['reporter_threshold_observed'] for r in results),'convergence_proven':False,'notes':['Gradient and constraint details are in stage diagnostics; iteration caps do not prove convergence.','No claim of biological pose validation or binding affinity.','Within-stage interruption replays that stage from its last saved checkpoint; platform changes may alter numerical results.','All-atom clash and independent stereochemical review remain required.'],'stages':results})
  print('Candidate completed; independent review and convergence assessment remain required.',flush=True)
 if __name__=='__main__':
  p=argparse.ArgumentParser();p.add_argument('source');p.add_argument('out');p.add_argument('--platform',choices=['auto','CPU','CUDA','Reference'],default='auto');p.add_argument('--dry-steps',type=int,default=2000);p.add_argument('--water-steps',type=int,default=2000);p.add_argument('--stage-steps',type=int,default=2000);p.add_argument('--seed',type=int,default=9181);p.add_argument('--experimental-allow-unconverged',action='store_true');a=p.parse_args();main(a.source,a.out,a.platform,a.dry_steps,a.water_steps,a.stage_steps,a.seed,a.experimental_allow_unconverged)

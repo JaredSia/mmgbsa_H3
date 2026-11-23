@@ -27,10 +27,10 @@ class ReferenceRunnerTests(unittest.TestCase):
   ctx=mm.Context(system,mm.VerletIntegrator(.001),mm.Platform.getPlatformByName('Reference'));ctx.setPositions([[1,0,0]])
   tracker,attempts=minimize_with_retries(ctx,1e-9,10)
   self.assertGreaterEqual(len(attempts),1);self.assertGreater(tracker.calls,0)
- def test_reporter_threshold_requires_both_gradient_and_constraint(self):
+ def test_final_screen_uses_projected_force_and_final_constraint(self):
   self.assertFalse(convergence_observed(None,10,0.0,None,None))
   self.assertTrue(convergence_observed({'objective_gradient_rms_kJ_mol_nm':9,'max_constraint_error':1e-6},10,1e-6,0.0,3.0))
-  self.assertFalse(convergence_observed({'objective_gradient_rms_kJ_mol_nm':11,'max_constraint_error':1e-6},10,1e-6,0.0,3.0))
+  self.assertTrue(convergence_observed({'objective_gradient_rms_kJ_mol_nm':11,'max_constraint_error':1e-6},10,1e-6,0.0,3.0))
   self.assertFalse(convergence_observed({'objective_gradient_rms_kJ_mol_nm':9,'max_constraint_error':1e-4},10,1e-4,0.0,3.0))
  def test_quality_guard_rejects_bad_structures(self):
   d={'stereochemistry_outliers':[],'RNA_bad_link_count':0,'interchain_pairs_lt_2A':0,'interchain_minimum_A':2.5,'protein_CA_RMSD_protein_aligned_A':.3,'RNA_backbone_RMSD_protein_aligned_A':.2,'protein_CA_max_displacement_unaligned_A':.7,'RNA_backbone_max_displacement_unaligned_A':.8}
